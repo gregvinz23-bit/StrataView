@@ -1,0 +1,5 @@
+opencv-python
+numpy
+PyQt6
+certifi
+git+https://github.com/OpenIPC/python-dvr.git

@@ -1,0 +1,22 @@
+[
+  {
+    "name": "Home CCTV",
+    "type": "dvrip",
+    "login_type": "CloudID",
+    "cloud_id": "YOUR_CLOUD_ID",
+    "user": "admin",
+    "password": "YOUR_PASSWORD",
+    "channel": 0,
+    "stream": 0,
+    "group": "Default Group",
+    "enabled": true
+  },
+  {
+    "name": "Front Door",
+    "type": "rtsp",
+    "login_type": "RTSP URL",
+    "url": "rtsp://user:pass@192.168.1.20:554/stream1",
+    "group": "Default Group",
+    "enabled": false
+  }
+]

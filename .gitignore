@@ -1,0 +1,27 @@
+# Python / PyInstaller artifacts
+__pycache__/
+*.pyc
+*.pyo
+build/
+dist/
+*.spec
+
+# Runtime data (local only, may contain footage and secrets)
+recordings/
+snapshots/
+logs/
+cameras.json
+settings.json
+
+# Cloud bridge: credentials + bulky binaries (see README for sources)
+cloud_bridge/_credentials.py
+cloud_bridge/__pycache__/
+cloud_bridge/ffmpeg.exe
+cloud_bridge/mediamtx.exe
+cloud_bridge/mediamtx.yml
+
+# Test / debug leftovers
+*.log
+probe*.bin
+*_preview.png
+*_tmp.py
