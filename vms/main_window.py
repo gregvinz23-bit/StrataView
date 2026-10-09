@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
+from datetime import datetime
 from PyQt6.QtCore import Qt, QSize, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QAction, QActionGroup, QDesktopServices, QImage, QPixmap
 from PyQt6.QtWidgets import (
@@ -35,6 +36,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from . import events
 from .backends import BaseSource, make_source
 from .recorder import SegmentRecorder
 from .resources import app_logo_pixmap, apply_icon
@@ -457,6 +459,7 @@ class PlaybackDialog(QDialog):
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
+        self._fps = 10.0
 
         self.cam_combo.currentTextChanged.connect(self._refresh_clips)
         self.clip_list.itemSelectionChanged.connect(self._open_selected)
@@ -481,17 +484,51 @@ class PlaybackDialog(QDialog):
         matches = [c for c in clips_for(name) if c.name == item.text()]
         return matches[0] if matches else None
 
-    def _open_selected(self) -> None:
+    def _open_selected(self) -> bool:
         path = self._current_path()
         if path is None:
-            return
+            return False
         self._stop_play()
         self._cap = cv2.VideoCapture(str(path))
         self._total = int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        fps = self._cap.get(cv2.CAP_PROP_FPS) or 10.0
-        self.timer.setInterval(max(20, int(1000 / fps)))
+        self._fps = self._cap.get(cv2.CAP_PROP_FPS) or 10.0
+        self.timer.setInterval(max(20, int(1000 / self._fps)))
         self.pos_slider.setRange(0, max(0, self._total - 1))
         self._toggle_play(force=True)
+        return True
+
+    def open_at(self, camera: str, moment) -> bool:
+        """Open the clip containing `moment` and seek to it. For event jumps."""
+        from datetime import datetime
+
+        idx = self.cam_combo.findText(camera)
+        if idx < 0:
+            return False
+        self.cam_combo.setCurrentIndex(idx)
+        if not isinstance(moment, datetime):
+            moment = datetime.now()
+        target = None
+        for clip in clips_for(camera):
+            try:
+                start = datetime.strptime(clip.stem[:15], "%Y%m%d_%H%M%S")
+            except ValueError:
+                continue
+            if start <= moment:
+                target = (clip, start)
+            else:
+                break
+        if target is None:
+            return False
+        clip, start = target
+        for i in range(self.clip_list.count()):
+            if self.clip_list.item(i).text() == clip.name:
+                self.clip_list.setCurrentRow(i)
+                break
+        if not self._open_selected():
+            return False
+        offset = max(0.0, (moment - start).total_seconds())
+        self._cap.set(cv2.CAP_PROP_POS_FRAMES, int(offset * (self._fps or 10.0)))
+        return True
 
     def _toggle_play(self, force: bool = False) -> None:
         if self._cap is None:
@@ -548,9 +585,12 @@ class MainWindow(QMainWindow):
         self.selected: str | None = None
         self.grid_cols = 2
         self._fs_view: FullscreenView | None = None
+        self.detectors: dict = {}
+        self.trackers: dict = {}
         self._blink_on = False
         self._tick_count = 0
         self._last_status: dict[str, str] = {}
+        self._motion_index: dict[tuple, dict] = {}
         # -- toolbar ----------------------------------------------------
         toolbar = QToolBar("Main")
         toolbar.setObjectName("MainToolbar")
@@ -657,6 +697,13 @@ class MainWindow(QMainWindow):
         snap_folder_act.triggered.connect(self._open_snapshots_folder)
         tools_menu.addAction(snap_folder_act)
         tools_menu.addSeparator()
+        sched_act = QAction("Recording schedules", self)
+        sched_act.triggered.connect(self._open_schedules)
+        tools_menu.addAction(sched_act)
+        health_act = QAction("Camera health", self)
+        health_act.triggered.connect(self._open_health)
+        tools_menu.addAction(health_act)
+        tools_menu.addSeparator()
         settings_act = QAction(app_icons.settings(), "Settings", self)
         settings_act.triggered.connect(self._open_settings)
         tools_menu.addAction(settings_act)
@@ -719,8 +766,19 @@ class MainWindow(QMainWindow):
         log_wrap = QWidget()
         log_layout = QVBoxLayout(log_wrap)
         log_layout.setContentsMargins(6, 6, 6, 6)
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Show:"))
+        self.log_filter = QComboBox()
+        self.log_filter.addItems(
+            ["All", "Motion", "Recording", "Camera", "App", "Snapshot", "View"]
+        )
+        self.log_filter.currentTextChanged.connect(self._refill_log_view)
+        filter_row.addWidget(self.log_filter)
+        filter_row.addStretch(1)
+        log_layout.addLayout(filter_row)
         self.log_view = QListWidget()
         self.log_view.setObjectName("LogView")
+        self.log_view.itemDoubleClicked.connect(self._on_log_doubleclick)
         log_layout.addWidget(self.log_view, 1)
         log_buttons = QHBoxLayout()
         export_btn = QPushButton("Export…")
@@ -746,7 +804,26 @@ class MainWindow(QMainWindow):
         self.log_timer.timeout.connect(self._refresh_log_view)
         self.log_timer.start(1000)
 
+        # Recording scheduler, motion detectors, health trackers.
+        # (self.detectors / self.trackers are created with the other state
+        # above because _load_all() already needs them.)
+        from .motion import MotionDetector
+        from .scheduler import Scheduler
+
+        self.scheduler = Scheduler(
+            get_sources=lambda: list(self.sources),
+            get_config=self._config_for,
+            is_motion_active=self._motion_active,
+            apply_state=self._apply_recording,
+            parent=self,
+        )
+        self.watchdog = QTimer(self)
+        self.watchdog.timeout.connect(self._watchdog_tick)
+        self.watchdog.start(15_000)
+
         events.log("app", "StrataView started.")
+        self.scheduler.evaluate()
+        QTimer.singleShot(10_000, self.scheduler.sweep)
 
         from .settings import load as load_settings
 
@@ -759,7 +836,9 @@ class MainWindow(QMainWindow):
         for cfg in load_cameras():
             if cfg.get("enabled", True):
                 self._start_source(cfg)
-        self._rebuild_grid()
+        # Fit the grid to the camera count: 1 -> single, up to 4 -> 2x2.
+        count = len(self.sources)
+        self._apply_layout_index(0 if count <= 1 else (1 if count <= 4 else 2))
         if self.sources:
             self._select(next(iter(self.sources)))
             self.statusBar().showMessage(
@@ -808,15 +887,130 @@ class MainWindow(QMainWindow):
         src.start()
         self.sources[name] = src
         events.log("camera", f"Connecting to {name}…")
+        self._ensure_helpers(name, cfg)
+
+    def _ensure_helpers(self, name: str, cfg: dict) -> None:
+        """Create/refresh the motion detector + health tracker for a camera."""
+        from .health import HealthTracker
+        from .motion import MotionDetector
+
+        src = self.sources.get(name)
+        if src is None:
+            return
+        if name not in self.trackers:
+            self.trackers[name] = HealthTracker()
+        det = self.detectors.get(name)
+        want_motion = cfg.get("record_mode", "scheduled") == "motion"
+        if want_motion and det is None:
+            import functools
+
+            det = MotionDetector(
+                src,
+                sensitivity=cfg.get("motion_sensitivity", "medium"),
+                on_event=functools.partial(self._on_motion, name),
+            )
+            det.start()
+            self.detectors[name] = det
+        elif want_motion and det is not None:
+            det.set_sensitivity(cfg.get("motion_sensitivity", "medium"))
+        elif not want_motion and det is not None:
+            det.stop()
+            del self.detectors[name]
+
+    def _drop_helpers(self, name: str) -> None:
+        det = self.detectors.pop(name, None)
+        if det is not None:
+            det.stop()
+        self.trackers.pop(name, None)
+
+    def _config_for(self, name: str) -> dict:
+        for cfg in load_cameras():
+            if cfg.get("name") == name:
+                return cfg
+        return {"name": name, "record_mode": "scheduled"}
+
+    def _motion_active(self, name: str) -> bool:
+        det = self.detectors.get(name)
+        return bool(det and det.active)
+
+    def _apply_recording(self, name: str, want: bool, auto: bool = False) -> None:
+        src = self.sources.get(name)
+        if src is None:
+            return
+        rec = self.recorders.get(name)
+        running = bool(rec and rec.running)
+        if want and not running:
+            from .settings import load as load_settings
+
+            segment = int(load_settings().get("segment_minutes", 10)) * 60
+            rec = SegmentRecorder(src, segment_seconds=segment)
+            self.recorders[name] = rec
+            rec.start()
+            self.statusBar().showMessage(f"Recording started: {name}")
+            events.log("recording", f"Recording started: {name}")
+        elif not want and running and rec is not None:
+            rec.stop()
+            clip = rec.current_file.name if rec.current_file else "clip"
+            events.log("recording", f"Recording stopped: {name} ({clip})")
+            self.statusBar().showMessage(f"Recording stopped: {name}")
+
+    def _on_motion(self, name: str) -> None:
+        from . import events
+
+        src = self.sources.get(name)
+        frame = src.latest() if src else None
+        now = datetime.now()
+        if frame is None:
+            message = f"Motion detected: {name}"
+        else:
+            path = snapshot_path(name, prefix="motion_")
+            try:
+                cv2.imwrite(str(path), frame)
+                message = f"Motion detected: {name} ({path.name})"
+            except Exception:
+                message = f"Motion detected: {name}"
+        stamp = events.log("motion", message)
+        self._motion_index[(stamp, "motion", message)] = {"camera": name, "at": now}
+
+    def _watchdog_tick(self) -> None:
+        from . import events
+        from .health import check_source
+
+        for name, src in list(self.sources.items()):
+            tracker = self.trackers.get(name)
+            if tracker is None:
+                continue
+            action = check_source(name, src, tracker)
+            if action == "restart":
+                events.log("camera", f"Stream stalled. Restarting {name}…")
+                self.statusBar().showMessage(f"Connection lost. Restarting {name}…")
+                src.stop()
+                src.start()
+            elif action == "unstable":
+                events.log(
+                    "camera",
+                    f"{name} is unstable. Pausing retries for 15 minutes. "
+                    "Use Retry to reconnect sooner.",
+                )
+                self.statusBar().showMessage(
+                    f"{name} is unstable — retrying later. Use Retry to reconnect sooner."
+                )
+                src.stop()
 
     # -- grid -----------------------------------------------------------
-    def _change_layout(self, index: int) -> None:
+    def _apply_layout_index(self, index: int) -> None:
         self.grid_cols = (1, 2, 3)[index]
         for i, act in enumerate(self.grid_group.actions()):
             act.blockSignals(True)
             act.setChecked(i == index)
             act.blockSignals(False)
+        self.layout_combo.blockSignals(True)
+        self.layout_combo.setCurrentIndex(index)
+        self.layout_combo.blockSignals(False)
         self._rebuild_grid()
+
+    def _change_layout(self, index: int) -> None:
+        self._apply_layout_index(index)
 
     def _rebuild_grid(self) -> None:
         while self.grid.count():
@@ -874,6 +1068,7 @@ class MainWindow(QMainWindow):
         self.cam_list.blockSignals(True)
         self.cam_list.clear()
         self._rows: dict[str, CameraRow] = {}
+        self._row_items: dict = {}
         names = list(self.sources)
         self.side_header.setText(f"Cameras ({len(names)})")
         for name in names:
@@ -882,6 +1077,7 @@ class MainWindow(QMainWindow):
             item.setSizeHint(QSize(200, 34))
             row = CameraRow(name)
             self._rows[name] = row
+            self._row_items[name] = item
             self.cam_list.addItem(item)
             self.cam_list.setItemWidget(item, row)
         self.cam_list.blockSignals(False)
@@ -903,6 +1099,7 @@ class MainWindow(QMainWindow):
 
     def _update_tiles(self) -> None:
         from . import events
+        from .health import HealthTracker
 
         self._tick_count += 1
         if self._tick_count % 5 == 0:  # ~1 Hz blink for REC badges
@@ -912,6 +1109,11 @@ class MainWindow(QMainWindow):
             if src is None:
                 continue
             status = src.status
+            tracker = self.trackers.get(name)
+            if tracker is None:
+                tracker = HealthTracker()
+                self.trackers[name] = tracker
+            tracker.observe(status, getattr(src, "frame_count", 0))
             if status != self._last_status.get(name):
                 self._last_status[name] = status
                 if status == "live":
@@ -920,6 +1122,8 @@ class MainWindow(QMainWindow):
                     events.log("camera", f"'{name}': {status}")
             tile.set_frame(src.latest(), status)
             tile.blink_rec(self._blink_on)
+            rec = self.recorders.get(name)
+            tile.set_recording(bool(rec and rec.running))
         for name, row in getattr(self, "_rows", {}).items():
             src = self.sources.get(name)
             rec = self.recorders.get(name)
@@ -927,6 +1131,23 @@ class MainWindow(QMainWindow):
                 live=(src.status == "live") if src else False,
                 recording=bool(rec and rec.running),
             )
+        for name, item in getattr(self, "_row_items", {}).items():
+            tracker = self.trackers.get(name)
+            src = self.sources.get(name)
+            if tracker and src:
+                item.setToolTip(
+                    f"{name}\nStatus: {src.status}\n"
+                    f"Uptime: {HealthTracker.format_uptime(tracker.live_seconds)}\n"
+                    f"Reconnects: {tracker.reconnects}\n"
+                    f"Rate: {tracker.fps:.0f} fps\n"
+                    f"Last error: {tracker.last_error or 'none'}"
+                )
+        if self.selected and self._tick_count % 5 == 0:
+            rec = self.recorders.get(self.selected)
+            on = bool(rec and rec.running)
+            self.rec_act.blockSignals(True)
+            self.rec_act.setChecked(on)
+            self.rec_act.blockSignals(False)
 
     def _select(self, name: str | None) -> None:
         self.selected = name
@@ -952,6 +1173,9 @@ class MainWindow(QMainWindow):
         return groups or ["Default Group"]
 
     def _save_config(self, cfg: dict) -> None:
+        from .scheduler import with_defaults
+
+        with_defaults(cfg)
         cameras = [c for c in load_cameras() if c.get("name") != cfg["name"]]
         cameras.append(cfg)
         save_cameras(cameras)
@@ -992,7 +1216,9 @@ class MainWindow(QMainWindow):
                               groups=self._known_groups(), allow_continue=False)
         if dlg.exec() != QDialog.DialogCode.Accepted or dlg.result_config is None:
             return
-        cfg = dlg.result_config
+        from .scheduler import with_defaults
+
+        cfg = with_defaults(dlg.result_config)
         old_name = name
         if cfg["name"] != old_name and cfg["name"] in self.sources:
             QMessageBox.warning(self, "Edit Device",
@@ -1002,6 +1228,7 @@ class MainWindow(QMainWindow):
         if old_name in self.recorders:
             self.recorders[old_name].stop()
             del self.recorders[old_name]
+        self._drop_helpers(old_name)
         if old_name in self.sources:
             self.sources[old_name].stop()
             del self.sources[old_name]
@@ -1027,6 +1254,7 @@ class MainWindow(QMainWindow):
         if name in self.recorders:
             self.recorders[name].stop()
             del self.recorders[name]
+        self._drop_helpers(name)
         if name in self.sources:
             self.sources[name].stop()
             del self.sources[name]
@@ -1063,25 +1291,17 @@ class MainWindow(QMainWindow):
             self.rec_act.setChecked(False)
             self.rec_act.blockSignals(False)
             return
-        rec = self.recorders.get(name)
+        cameras = load_cameras()
+        for cfg in cameras:
+            if cfg.get("name") == name:
+                cfg["record_mode"] = "always" if on else "off"
+                break
+        save_cameras(cameras)
+        self._apply_recording(name, on)
         if on:
-            if rec is None:
-                from .settings import load as load_settings
-
-                segment = int(load_settings().get("segment_minutes", 10)) * 60
-                rec = SegmentRecorder(src, segment_seconds=segment)
-                self.recorders[name] = rec
-            rec.start()
-            self.statusBar().showMessage(f"Recording started: {name}")
-            events.log("recording", f"Recording started: {name}")
+            events.log("recording", f"Recording set to Always: {name}")
         else:
-            if rec is not None:
-                rec.stop()
-                clip = rec.current_file.name if rec.current_file else "clip"
-                events.log("recording", f"Recording stopped: {name} ({clip})")
-            self.statusBar().showMessage(f"Recording stopped: {name}")
-        if name in self.tiles:
-            self.tiles[name].set_recording(on)
+            events.log("recording", f"Recording turned off: {name}")
 
     def _toggle_sidebar(self, on: bool) -> None:
         self.side.setVisible(on)
@@ -1097,14 +1317,39 @@ class MainWindow(QMainWindow):
         self.log_dock.setVisible(on)
 
     # -- event log ------------------------------------------------------
+    def _log_matches_filter(self, category: str) -> bool:
+        wanted = self.log_filter.currentText()
+        return wanted == "All" or category == wanted.lower()
+
+    def _refill_log_view(self) -> None:
+        from . import events
+
+        self.log_view.clear()
+        self._log_view_index = 0
+        self._refresh_log_view()
+
     def _refresh_log_view(self) -> None:
         from . import events
 
         entries = events.get_all()
         for stamp, category, message in entries[self._log_view_index :]:
-            self.log_view.addItem(events.format_entry(stamp, category, message))
+            if not self._log_matches_filter(category):
+                continue
+            item = QListWidgetItem(events.format_entry(stamp, category, message))
+            key = (stamp, category, message)
+            if key in self._motion_index:
+                item.setData(Qt.ItemDataRole.UserRole, self._motion_index[key])
+            self.log_view.addItem(item)
             self.log_view.scrollToBottom()
         self._log_view_index = len(entries)
+
+    def _on_log_doubleclick(self, item: QListWidgetItem) -> None:
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(data, dict) or "camera" not in data:
+            return
+        dlg = PlaybackDialog(list(self.sources), self)
+        if dlg.open_at(data["camera"], data.get("at")):
+            dlg.exec()
 
     def _export_log(self) -> None:
         from datetime import datetime
@@ -1170,6 +1415,53 @@ class MainWindow(QMainWindow):
         self.sidebar_act.blockSignals(False)
         self.statusBar().showMessage("Settings saved.")
         events.log("app", "Settings saved.")
+
+    def _open_schedules(self) -> None:
+        from . import events
+        from .schedule_dialog import ScheduleDialog
+
+        cameras = load_cameras()
+        dlg = ScheduleDialog(cameras, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        updated, retention = dlg.results()
+        save_cameras(updated)
+        from .settings import load as load_settings
+        from .settings import save as save_settings
+
+        settings = load_settings()
+        settings.update(retention)
+        save_settings(settings)
+        # Refresh detectors (mode/sensitivity may have changed).
+        for cfg in updated:
+            name = cfg.get("name", "")
+            if name in self.sources:
+                self._ensure_helpers(name, cfg)
+        self.scheduler.evaluate()
+        self.statusBar().showMessage("Recording schedules saved.")
+        events.log("app", "Recording schedules saved.")
+
+    def _open_health(self) -> None:
+        from .health import HealthDialog, HealthTracker
+
+        def rows():
+            out = []
+            for name, src in self.sources.items():
+                tracker = self.trackers.get(name)
+                if tracker is None:
+                    tracker = HealthTracker()
+                    self.trackers[name] = tracker
+                out.append((
+                    name,
+                    src.status,
+                    HealthTracker.format_uptime(tracker.live_seconds),
+                    tracker.reconnects,
+                    f"{tracker.fps:.0f} fps",
+                    tracker.last_error or "—",
+                ))
+            return out
+
+        HealthDialog(rows, self).exec()
 
     def _open_playback(self) -> None:
         if not self.sources:
@@ -1298,6 +1590,13 @@ class MainWindow(QMainWindow):
             self._fs_view.close()
         self.refresh.stop()
         self.log_timer.stop()
+        try:
+            self.scheduler.timer.stop()
+            self.scheduler.sweep_timer.stop()
+        except Exception:
+            pass
+        for det in self.detectors.values():
+            det.stop()
         for rec in self.recorders.values():
             rec.stop()
         for src in self.sources.values():

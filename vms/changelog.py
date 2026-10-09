@@ -2,6 +2,15 @@
 
 CHANGELOG: list[tuple[str, list[str]]] = [
     (
+        "1.2.0",
+        [
+            "Recording modes per camera: always, scheduled hours, motion only, off.",
+            "Per-weekday recording schedules with retention (days + disk cap).",
+            "Motion detection with event feed, snapshots, click-to-playback.",
+            "Camera health watchdog: stall restarts, backoff, health dialog.",
+        ],
+    ),
+    (
         "1.1.0",
         [
             "Event log with export (View menu).",

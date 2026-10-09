@@ -26,7 +26,7 @@ def _log_file() -> Path:
     return d / f"strataview-{datetime.now():%Y%m%d}.log"
 
 
-def log(category: str, message: str) -> None:
+def log(category: str, message: str) -> str:
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with _lock:
         _entries.append((stamp, category, message))
@@ -35,6 +35,7 @@ def log(category: str, message: str) -> None:
                 f.write(f"[{stamp}] [{category}] {message}\n")
         except OSError:
             pass
+    return stamp
 
 
 def get_all() -> list[tuple[str, str, str]]:

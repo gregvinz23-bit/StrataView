@@ -54,6 +54,8 @@ class BaseSource:
         self._thread: threading.Thread | None = None
         self._status = "stopped"
         self._status_lock = threading.Lock()
+        self.frame_count = 0
+        self.last_frame_time = 0.0
 
     # -- lifecycle -----------------------------------------------------
     def start(self) -> None:
@@ -102,6 +104,8 @@ class BaseSource:
             if frame is not None:
                 with self._lock:
                     self._frame = frame
+                self.frame_count += 1
+                self.last_frame_time = time.time()
                 self._set_status("live")
             self._stop.wait(self.poll_interval)
 

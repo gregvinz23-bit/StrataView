@@ -93,8 +93,8 @@ def clips_for(name: str) -> list[Path]:
     return sorted(d.glob("*.mp4"))
 
 
-def snapshot_path(name: str) -> Path:
+def snapshot_path(name: str, prefix: str = "") -> Path:
     ensure_dirs()
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in name).strip() or "camera"
-    return snapshots_root() / f"{safe}_{stamp}.jpg"
+    return snapshots_root() / f"{prefix}{safe}_{stamp}.jpg"

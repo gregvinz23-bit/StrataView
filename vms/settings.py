@@ -30,6 +30,8 @@ DEFAULTS = {
     "snapshots_dir": "",
     "segment_minutes": 10,
     "show_sidebar": True,
+    "retention_days": 7,
+    "max_disk_percent": 80,
 }
 
 

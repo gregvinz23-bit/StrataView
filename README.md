@@ -9,9 +9,11 @@ plus a portable Windows build.
 - Live grid (1, 2×2, 3×3) with camera list sidebar and status indicators
 - CloudID (P2P) cameras via the bundled bridge (vendor NetSdk login),
   direct DVRIP over LAN, and generic RTSP
-- Recording with configurable segments, playback with seek, snapshots
-- Event log with export, per-tile Retry on failures, fullscreen camera view
-- Setup wizard, splash screen, settings, update check, dark theme
+- Recording with per-camera modes (always, scheduled hours, motion only),
+  retention (days + disk cap), playback with seek, snapshots
+- Motion detection with event feed and click-to-playback
+- Camera health watchdog (stall restarts, backoff) and health dialog
+- Event log with export, fullscreen views, setup wizard, settings
 
 ## Run from source (Windows)
 
