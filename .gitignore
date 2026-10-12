@@ -19,6 +19,9 @@ cloud_bridge/__pycache__/
 cloud_bridge/ffmpeg.exe
 cloud_bridge/mediamtx.exe
 cloud_bridge/mediamtx.yml
+cloud_bridge/hls/
+cloud_bridge/demo_*.log
+cloud_bridge/demo_*.err
 
 # Test / debug leftovers
 *.log
