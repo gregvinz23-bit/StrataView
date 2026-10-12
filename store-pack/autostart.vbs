@@ -5,8 +5,8 @@ Set sh = CreateObject("Wscript.Shell")
 packDir = fso.GetParentFolderName(WScript.ScriptFullName)
 bridgeDir = fso.BuildPath(packDir, "cloud_bridge")
 
-' 1. Camera bridge (windowless, logs to file).
-sh.Run "pythonw.exe """ & fso.BuildPath(bridgeDir, "xmeye_cloud_to_rtsp.py") & """ --port 8090 >> """ & fso.BuildPath(bridgeDir, "bridge.log") & """ 2>&1", 0, False
+' 1. Camera bridge (windowless; output is discarded).
+sh.Run "pythonw.exe """ & fso.BuildPath(bridgeDir, "xmeye_cloud_to_rtsp.py") & """ --port 8090", 0, False
 
 ' 2. Phone stream (windowless).
 sh.Run "pythonw.exe """ & fso.BuildPath(bridgeDir, "hlsserve.py") & """ --scale 640x360 --bitrate 0.8M", 0, False
